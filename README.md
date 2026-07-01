@@ -13,7 +13,7 @@ All three share the identical stencil math and the identical coloring
 (`Stencil.h`), so their output is **pixel-for-pixel identical** — what you compare
 is speed.
 
-![screenshot placeholder](screenshot.png)
+![screenshot](screenshot.png)
 
 ## What it demonstrates
 
