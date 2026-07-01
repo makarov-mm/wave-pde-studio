@@ -1,0 +1,41 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "vs2022-cuda",
+      "displayName": "Visual Studio (x64, CUDA)",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_PREFIX_PATH": "C:\Qt\6.11.1\msvc2022_64",
+        "USE_CUDA": "ON",
+        "CUDA_ARCH": "89"
+      }
+    },
+    {
+      "name": "vs2022-cpu",
+      "displayName": "Visual Studio (x64, CPU only)",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build-cpu",
+      "cacheVariables": {
+        "CMAKE_PREFIX_PATH": "C:\Qt\6.11.1\msvc2022_64",
+        "USE_CUDA": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "cuda-release",
+      "configurePreset": "vs2022-cuda",
+      "configuration": "Release"
+    },
+    {
+      "name": "cpu-release",
+      "configurePreset": "vs2022-cpu",
+      "configuration": "Release"
+    }
+  ]
+}
