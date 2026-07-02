@@ -1,15 +1,18 @@
 # Wave / Heat PDE Studio — CPU vs CUDA
 
 A real-time 2D partial-differential-equation simulator built with **Qt 6 (C++17)**.
-It solves the **wave equation** and the **heat equation** on a grid with finite
-differences, and runs the exact same simulation on three back-ends so you can
-compare their performance live:
+It solves the **wave equation**, the **heat equation**, and the **Gray–Scott
+reaction–diffusion system** on a grid with finite differences, and runs the exact
+same simulation on four back-ends so you can compare their performance live:
 
 - **CPU (single-threaded)** — a straightforward baseline
-- **CPU (multi-threaded)** — the same stencil parallelized across rows with `std::thread`
-- **CUDA (GPU)** — one thread per grid cell
+- **CPU (multi-threaded)** — the same stencil parallelized across rows with a persistent thread pool
+- **CUDA (GPU)** — one thread per grid cell, global-memory reads
+- **CUDA (GPU, tiled)** — one thread per cell, but each block first stages an
+  18×18 tile (16×16 plus a one-cell halo) into shared memory, then computes the
+  Laplacian from the tile
 
-All three share the identical stencil math and the identical coloring
+All back-ends share the identical stencil math and the identical coloring
 (`Stencil.h`), so their output is **pixel-for-pixel identical** — what you compare
 is speed.
 
@@ -19,88 +22,118 @@ is speed.
 
 This is a **stencil / finite-difference time-stepping** workload — a different
 parallel pattern from an embarrassingly-parallel fractal or an all-pairs N-body
-simulation. Each cell is updated from its four neighbors every step, and the
-grid evolves over time (the state is stateful, unlike a per-pixel fractal).
+simulation. Each cell is updated from its four neighbors every step, the state
+is carried between steps, and the memory-access pattern (each value read by five
+threads) is exactly the case shared-memory tiling was designed for.
 
-- **Wave equation** `u_tt = c² ∇²u` — solved with a leapfrog scheme (keeps the
-  previous field), with adjustable speed and damping. Click to drop a pulse and
-  watch ripples radiate and reflect off the edges.
-- **Heat equation** `u_t = α ∇²u` — solved with explicit forward Euler; paint
-  heat onto the grid and watch it diffuse.
+### Equations
 
-## Features
+- **Wave equation** `u_tt = c² ∇²u` — leapfrog scheme (keeps the previous
+  field), adjustable speed and damping. Click to drop a pulse and watch ripples
+  radiate, reflect, and diffract.
+- **Heat equation** `u_t = α ∇²u` — explicit forward Euler; paint heat onto the
+  grid and watch it diffuse.
+- **Gray–Scott reaction–diffusion** — two coupled fields *u*, *v* with
+  `u_t = Dᵤ∇²u − uv² + F(1−u)` and `v_t 	= Dᵥ∇²v + uv² − (F+k)v`.
+  Depending on the feed/kill rates it self-organizes into corals, spots,
+  worms, dividing cells, or chaos. Preset patterns included
+  (**Coral, Mitosis, Worms, Spots, Chaos**) plus free Feed/Kill sliders.
 
-- Switch between wave and heat equations
-- Selectable grid size (256² / 512² / 1024²)
-- Adjustable wave speed, diffusion, damping, steps-per-frame, and palette
-- **Click / drag on the canvas** to inject a disturbance
-- Play / Pause / Reset
-- **Benchmark all backends** — advances a fixed batch of steps on each back-end
-  from the same starting field and reports ms-per-step plus the speedup relative
-  to single-threaded CPU
+### Boundary conditions
 
-## Requirements
+Selectable per run, implemented once in `Stencil.h` and used by both CPU and
+CUDA paths:
 
-- **Qt 6** (Widgets module)
-- **CMake 3.20+**
-- A C++17 compiler (MSVC 2022 / GCC / Clang)
-- For the GPU back-end: **NVIDIA CUDA Toolkit** and an NVIDIA GPU
-  (without them the project builds CPU-only and the CUDA option disappears)
+- **Dirichlet** (fixed edges — waves reflect with inversion)
+- **Neumann** (reflective — zero normal derivative, waves reflect without inversion)
+- **Periodic** (torus — waves leaving on one side re-enter on the other)
 
-## Building a Visual Studio solution (Windows, with CUDA)
+### Obstacles and scenes
 
-CUDA on Windows requires the **MSVC** host compiler (not MinGW), so use a Qt build
-for MSVC (e.g. `C:\Qt\6.x.x\msvc2022_64`).
+Any cell can be marked as a **wall**: walls are pinned to the rest value each
+step, so waves reflect off them and Gray–Scott patterns grow around them.
+Paint walls with the **right mouse button**, erase with **Shift + right button**.
 
-1. Edit `generate_vs_solution.bat`, set `QT_DIR` to your MSVC Qt install, save.
-2. Double-click it — it produces `build\WavePDEStudio.sln`.
-   (No `-G` is passed, so CMake auto-detects the newest installed Visual Studio.)
-3. Open the solution, set **WavePDEStudio** as startup project, Release | x64, build.
+Built-in scenes rebuild the wall mask on demand:
 
-Command line equivalent:
+- **Double slit** — a wall with two gaps; drop a pulse behind it and watch the
+  classic interference pattern form
+- **Ring cavity** — a circular resonator with a small opening
+- **Pillar lattice** — an 8×8 array of circular pillars (a crude photonic crystal)
 
-```powershell
-cmake -B build -S . -A x64 -DCMAKE_PREFIX_PATH="C:/Qt/6.x.x/msvc2022_64" -DUSE_CUDA=ON -DCUDA_ARCH=89
+### Rendering
+
+Five palettes: **Thermal (diverging)**, **Ocean (diverging)**, **Mono**,
+**Viridis**, and **Magma** — the last two are piecewise-linear LUT
+approximations of the matplotlib colormaps. The current frame can be saved with
+**Export PNG**.
+
+## The four back-ends
+
+| Backend | Idea |
+|---|---|
+| CPU (single) | Plain double loop over rows/columns |
+| CPU (multi) | Rows split into chunks, distributed over a **persistent thread pool** (workers park on a condition variable between substeps — no thread creation per step) |
+| CUDA (naive) | One thread per cell, neighbors read from global memory |
+| CUDA (tiled) | Each 16×16 block stages an 18×18 tile into `__shared__` memory, halo included, then computes from the tile — each global value is loaded once per block instead of up to five times |
+
+The **Benchmark all back-ends** button runs 100 identical steps on each and
+reports ms/step and the speed-up factor. The live timing panel additionally
+shows an exponential moving average and throughput in **Mcells/s**.
+
+Because the operand order in the tiled kernels matches the naive kernels
+exactly, all four back-ends stay bit-identical.
+
+## Controls
+
+| Action | Input |
+|---|---|
+| Inject pulse / heat / chemical | Left mouse drag |
+| Paint wall | Right mouse drag |
+| Erase wall | Shift + right mouse drag |
+| Pause / resume | `Space` |
+| Reset | `R` |
+| Brush size / power | Sliders in the panel |
+
+## Building
+
+Requirements: **CMake ≥ 3.21**, **Qt 6** (Widgets), a C++17 compiler, and
+optionally the **CUDA toolkit** (12.x recommended).
+
+```bash
+# with CUDA (set your GPU architecture; 89 = Ada / RTX 40xx)
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=ON -DCUDA_ARCH=89
+cmake --build build --config Release
+
+# CPU-only (no CUDA toolkit needed; the two CUDA back-ends are hidden)
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=OFF
 cmake --build build --config Release
 ```
 
-`CUDA_ARCH` defaults to 89 (Ada / RTX 40xx); use 86 for Ampere, 75 for Turing.
+On Windows with Visual Studio, `generate_vs_solution.bat` /
+`generate_vs_solution_cpu.bat` generate a solution (edit the Qt path inside if
+needed).
 
-## Building without CUDA (CPU only — e.g. on macOS)
+## Project layout
 
-CUDA does not exist on macOS, and any machine without an NVIDIA GPU should build
-CPU-only:
-
-```bash
-cmake -B build -S . -DUSE_CUDA=OFF -DCMAKE_PREFIX_PATH="/path/to/Qt/6.x.x/<kit>"
-cmake --build build
+```
+src/
+  Types.h        — SimParams, enums (equation, backend, boundary, scene, palette)
+  Stencil.h      — shared stencil math + coloring; compiled as C++ AND as CUDA device code
+  Simulator.h/.cpp — grid state, wall mask, scenes, CPU back-ends, thread pool
+  CudaWave.h/.cu — CUDA back-ends (naive + shared-memory tiled), buffer/mask caching
+  MainWindow.*   — UI, benchmark, presets, export
+  SimWidget.*    — canvas, mouse painting
+  main.cpp
 ```
 
-The CUDA back-end is simply left out; the two CPU back-ends remain.
+## Notes on correctness
 
-## Implementation notes
-
-- `Types.h` and `Stencil.h` are Qt-free and compile under both a normal C++
-  compiler and nvcc. The `SC_HD` macro expands to `__host__ __device__` under
-  nvcc and to nothing otherwise, so one stencil and one `colorize()` run on both
-  the CPU and the GPU.
-- The simulation state lives on the host. The CUDA back-end uploads the field,
-  iterates entirely on the device (rotating buffers between steps, no per-step
-  copies), then downloads the result; the reported time is the honest wall time
-  for a whole batch of steps.
-- Stability is respected: the wave scheme keeps the Courant number below the 2D
-  limit, and the heat scheme keeps α below 0.25.
-
-## Possible improvements
-
-- **Shared-memory tiling** for the stencil kernel: load a tile plus its halo into
-  shared memory once per block instead of reading global memory five times per
-  cell — the classic stencil optimization and a clear next step.
-- Keep the field resident on the GPU while the CUDA back-end is active, uploading
-  only on backend switches, to remove the per-frame transfer entirely.
-- Absorbing (PML) boundaries instead of the simple zero boundary.
-- 3D grids; other PDEs (reaction-diffusion, Schrödinger).
+A headless test drives all 3 equations × 3 boundary conditions × 4 scenes with
+an injected pulse and a painted wall, and asserts that the single-threaded and
+multi-threaded CPU back-ends produce **bit-identical** images in every
+combination, and that save/restore of the field round-trips exactly.
 
 ## License
 
-MIT — do whatever you like, no warranty.
+MIT — see [LICENSE](LICENSE).

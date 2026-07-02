@@ -1,11 +1,13 @@
 #include "SimWidget.h"
 #include <QPainter>
 #include <QMouseEvent>
+#include <algorithm>
 
 SimWidget::SimWidget(QWidget* parent) : QWidget(parent) {
     setMinimumSize(320, 320);
     setCursor(Qt::CrossCursor);
     setAttribute(Qt::WA_OpaquePaintEvent, true);
+    setContextMenuPolicy(Qt::NoContextMenu);   // right button is the wall brush
 }
 
 void SimWidget::setImage(const QImage& img) {
@@ -22,28 +24,35 @@ void SimWidget::paintEvent(QPaintEvent*) {
     }
 }
 
-void SimWidget::emitInject(const QPointF& pos) {
-    if (width() <= 0 || height() <= 0) return;
-    float nx = (float)(pos.x() / width());
-    float ny = (float)(pos.y() / height());
+QPointF SimWidget::normalized(const QPointF& pos) const {
+    float nx = (width()  > 0) ? (float)(pos.x() / width())  : 0.0f;
+    float ny = (height() > 0) ? (float)(pos.y() / height()) : 0.0f;
     nx = std::min(1.0f, std::max(0.0f, nx));
     ny = std::min(1.0f, std::max(0.0f, ny));
-    emit injectAt(nx, ny);
+    return QPointF(nx, ny);
 }
 
 void SimWidget::mousePressEvent(QMouseEvent* e) {
+    QPointF n = normalized(e->position());
     if (e->button() == Qt::LeftButton) {
         m_drawing = true;
-        emitInject(e->position());
+        emit injectAt((float)n.x(), (float)n.y());
+    } else if (e->button() == Qt::RightButton) {
+        m_wallDrawing = true;
+        m_wallErase   = e->modifiers().testFlag(Qt::ShiftModifier);
+        emit wallAt((float)n.x(), (float)n.y(), m_wallErase);
     }
 }
 
 void SimWidget::mouseMoveEvent(QMouseEvent* e) {
+    QPointF n = normalized(e->position());
     if (m_drawing)
-        emitInject(e->position());
+        emit injectAt((float)n.x(), (float)n.y());
+    if (m_wallDrawing)
+        emit wallAt((float)n.x(), (float)n.y(), m_wallErase);
 }
 
 void SimWidget::mouseReleaseEvent(QMouseEvent* e) {
-    if (e->button() == Qt::LeftButton)
-        m_drawing = false;
+    if (e->button() == Qt::LeftButton)  m_drawing     = false;
+    if (e->button() == Qt::RightButton) m_wallDrawing = false;
 }
