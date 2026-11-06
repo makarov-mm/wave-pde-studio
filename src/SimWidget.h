@@ -1,32 +1,34 @@
 #pragma once
-#include <QWidget>
 #include <QImage>
+#include <QWidget>
 
-// Displays the field (scaled to the widget) and reports where the user clicks
-// or drags, as normalized [0,1] coordinates:
-//   * left-drag            -> injectAt()  (add a pulse / seed)
-//   * right-drag           -> wallAt(erase = false)  (paint an obstacle)
-//   * Shift + right-drag   -> wallAt(erase = true)   (erase obstacles)
+// Displays the field, scaled to the widget with its aspect ratio preserved, and
+// reports where the user clicks or drags as normalized [0, 1] grid coordinates:
+//   * left-drag            -> injectAt()                 (add a pulse / seed)
+//   * right-drag           -> wallAt(erase = false)      (paint an obstacle)
+//   * Shift + right-drag   -> wallAt(erase = true)       (erase obstacles)
 class SimWidget : public QWidget {
     Q_OBJECT
 public:
     explicit SimWidget(QWidget* parent = nullptr);
-    void setImage(const QImage& img);
+    void setImage(QImage image);
 
 signals:
-    void injectAt(float nx, float ny);              // normalized [0,1] coords
-    void wallAt(float nx, float ny, bool erase);    // normalized [0,1] coords
+    void injectAt(float nx, float ny);
+    void wallAt(float nx, float ny, bool erase);
 
 protected:
-    void paintEvent(QPaintEvent*) override;
-    void mousePressEvent(QMouseEvent*) override;
-    void mouseMoveEvent(QMouseEvent*) override;
-    void mouseReleaseEvent(QMouseEvent*) override;
+    void paintEvent(QPaintEvent* event) override;
+    void mousePressEvent(QMouseEvent* event) override;
+    void mouseMoveEvent(QMouseEvent* event) override;
+    void mouseReleaseEvent(QMouseEvent* event) override;
 
 private:
-    QPointF normalized(const QPointF& pos) const;
+    QRect   imageRect() const;                       // where the image is drawn
+    QPointF normalized(const QPointF& position) const;
+
     QImage m_image;
-    bool   m_drawing     = false;   // left button held
-    bool   m_wallDrawing = false;   // right button held
-    bool   m_wallErase   = false;
+    bool   m_injecting    = false;   // left button held
+    bool   m_paintingWall = false;   // right button held
+    bool   m_erasingWall  = false;   // Shift was held when the right button went down
 };

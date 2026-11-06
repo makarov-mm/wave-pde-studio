@@ -1,27 +1,33 @@
 {
   "version": 3,
-  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
   "configurePresets": [
     {
-      "name": "vs2022-cuda",
-      "displayName": "Visual Studio (x64, CUDA)",
-      "generator": "Visual Studio 17 2022",
+      "name": "windows-base",
+      "hidden": true,
+      "description": "Newest installed Visual Studio, x64. Point CMAKE_PREFIX_PATH at your Qt installation.",
       "architecture": "x64",
+      "cacheVariables": {
+        "CMAKE_PREFIX_PATH": "C:/Qt/6.11.1/msvc2022_64"
+      },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
+      "name": "windows-cuda",
+      "inherits": "windows-base",
+      "displayName": "Windows x64, CUDA",
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
-        "CMAKE_PREFIX_PATH": "C:\Qt\6.11.1\msvc2022_64",
         "USE_CUDA": "ON",
         "CUDA_ARCH": "89"
       }
     },
     {
-      "name": "vs2022-cpu",
-      "displayName": "Visual Studio (x64, CPU only)",
-      "generator": "Visual Studio 17 2022",
-      "architecture": "x64",
+      "name": "windows-cpu",
+      "inherits": "windows-base",
+      "displayName": "Windows x64, CPU only",
       "binaryDir": "${sourceDir}/build-cpu",
       "cacheVariables": {
-        "CMAKE_PREFIX_PATH": "C:\Qt\6.11.1\msvc2022_64",
         "USE_CUDA": "OFF"
       }
     }
@@ -29,12 +35,12 @@
   "buildPresets": [
     {
       "name": "cuda-release",
-      "configurePreset": "vs2022-cuda",
+      "configurePreset": "windows-cuda",
       "configuration": "Release"
     },
     {
       "name": "cpu-release",
-      "configurePreset": "vs2022-cpu",
+      "configurePreset": "windows-cpu",
       "configuration": "Release"
     }
   ]

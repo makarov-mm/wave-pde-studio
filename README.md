@@ -8,7 +8,7 @@
 [![Instagram](https://img.shields.io/badge/Instagram-E4405F?logo=instagram&logoColor=white)](https://www.instagram.com/m.m.makarov/)
 ![CUDA](https://img.shields.io/badge/CUDA-76B900?logo=nvidia&logoColor=white)
 
-A real-time 2D partial-differential-equation simulator built with **Qt 6 (C++17)**.
+A real-time 2D partial-differential-equation simulator built with **Qt 6 (C++23)**.
 It solves the **wave equation**, the **heat equation**, and the **Gray–Scott
 reaction–diffusion system** on a grid with finite differences, and runs the exact
 same simulation on four back-ends so you can compare their performance live:
@@ -20,9 +20,9 @@ same simulation on four back-ends so you can compare their performance live:
   18×18 tile (16×16 plus a one-cell halo) into shared memory, then computes the
   Laplacian from the tile
 
-All back-ends share the identical stencil math and the identical coloring
-(`Stencil.h`), so their output is **pixel-for-pixel identical** — what you compare
-is speed.
+All back-ends call the same cell-update functions (`Stencil.h`) and are built
+without fused multiply-add, so they produce **bit-identical** fields — what you
+compare is speed.
 
 ![screenshot](screenshot.png)
 
@@ -42,7 +42,7 @@ threads) is exactly the case shared-memory tiling was designed for.
 - **Heat equation** `u_t = α ∇²u` — explicit forward Euler; paint heat onto the
   grid and watch it diffuse.
 - **Gray–Scott reaction–diffusion** — two coupled fields *u*, *v* with
-  `u_t = Dᵤ∇²u − uv² + F(1−u)` and `v_t 	= Dᵥ∇²v + uv² − (F+k)v`.
+  `u_t = Dᵤ∇²u − uv² + F(1−u)` and `v_t = Dᵥ∇²v + uv² − (F+k)v`.
   Depending on the feed/kill rates it self-organizes into corals, spots,
   worms, dividing cells, or chaos. Preset patterns included
   (**Coral, Mitosis, Worms, Spots, Chaos**) plus free Feed/Kill sliders.
@@ -71,26 +71,28 @@ Built-in scenes rebuild the wall mask on demand:
 
 ### Rendering
 
-Five palettes: **Thermal (diverging)**, **Ocean (diverging)**, **Mono**,
+Five palettes: **Thermal (diverging)**, **Ocean (diverging)**, **Grayscale**,
 **Viridis**, and **Magma** — the last two are piecewise-linear LUT
-approximations of the matplotlib colormaps. The current frame can be saved with
-**Export PNG**.
+approximations of the matplotlib colormaps. The grid is shown with its aspect
+ratio preserved, and the current frame can be saved with **Export PNG**.
 
 ## The four back-ends
 
 | Backend | Idea |
 |---|---|
-| CPU (single) | Plain double loop over rows/columns |
+| CPU (single) | Plain loop over rows/columns; interior cells skip the boundary logic, so the compiler can vectorize the hot loop |
 | CPU (multi) | Rows split into chunks, distributed over a **persistent thread pool** (workers park on a condition variable between substeps — no thread creation per step) |
 | CUDA (naive) | One thread per cell, neighbors read from global memory |
 | CUDA (tiled) | Each 16×16 block stages an 18×18 tile into `__shared__` memory, halo included, then computes from the tile — each global value is loaded once per block instead of up to five times |
 
-The **Benchmark all back-ends** button runs 100 identical steps on each and
-reports ms/step and the speed-up factor. The live timing panel additionally
-shows an exponential moving average and throughput in **Mcells/s**.
+The **Benchmark all backends** button runs one warm-up step (thread start-up,
+CUDA context and allocations stay out of the numbers), then 100 identical steps
+on each back-end, and reports ms/step and the speed-up factor. The live timing
+panel additionally shows an exponential moving average and throughput in
+**Mcells/s**. GPU timings include the host↔device transfers.
 
-Because the operand order in the tiled kernels matches the naive kernels
-exactly, all four back-ends stay bit-identical.
+If the GPU can't run the kernels (no driver, or a build for another compute
+capability), the CUDA back-ends are hidden and the reason is shown in the panel.
 
 ## Controls
 
@@ -105,8 +107,9 @@ exactly, all four back-ends stay bit-identical.
 
 ## Building
 
-Requirements: **CMake ≥ 3.21**, **Qt 6** (Widgets), a C++17 compiler, and
-optionally the **CUDA toolkit** (12.x recommended).
+Requirements: **CMake ≥ 3.21**, **Qt 6** (Widgets), a **C++23** compiler
+(Visual Studio 2022/2026, GCC 13+, Clang 18+), and optionally the **CUDA toolkit**
+(12.x or 13.x; the CUDA sources need C++20 only).
 
 ```bash
 # with CUDA (set your GPU architecture; 89 = Ada / RTX 40xx)
@@ -118,29 +121,44 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=OFF
 cmake --build build --config Release
 ```
 
-On Windows with Visual Studio, `generate_vs_solution.bat` /
-`generate_vs_solution_cpu.bat` generate a solution (edit the Qt path inside if
-needed).
+On Windows, `CMakePresets.json` holds the Qt path (`CMAKE_PREFIX_PATH`) and the
+CUDA architecture; edit them there or override them in a `CMakeUserPresets.json`.
+Then either run `generate_vs_solution.bat` / `generate_vs_solution_cpu.bat` to
+get a Visual Studio solution, or use the presets directly:
+
+```bat
+cmake --preset windows-cuda
+cmake --build --preset cuda-release
+```
 
 ## Project layout
 
 ```
 src/
-  Types.h        — SimParams, enums (equation, backend, boundary, scene, palette)
-  Stencil.h      — shared stencil math + coloring; compiled as C++ AND as CUDA device code
-  Simulator.h/.cpp — grid state, wall mask, scenes, CPU back-ends, thread pool
-  CudaWave.h/.cu — CUDA back-ends (naive + shared-memory tiled), buffer/mask caching
-  MainWindow.*   — UI, benchmark, presets, export
-  SimWidget.*    — canvas, mouse painting
+  Types.h          — SimParams and the enums (equation, boundary, scene, palette)
+  Stencil.h        — shared cell math; compiled as C++ AND as CUDA device code
+  Colormap.h       — palettes, field value -> pixel
+  RowPool.h/.cpp   — persistent thread pool for the multi-threaded back-end
+  Simulator.h/.cpp — grid state, wall mask, scenes, CPU back-ends
+  CudaWave.h/.cu   — CUDA back-ends (naive + shared-memory tiled), device buffers
+  MainWindow.*     — UI, benchmark, presets, export
+  SimWidget.*      — canvas, mouse painting
   main.cpp
 ```
 
 ## Notes on correctness
 
-A headless test drives all 3 equations × 3 boundary conditions × 4 scenes with
-an injected pulse and a painted wall, and asserts that the single-threaded and
-multi-threaded CPU back-ends produce **bit-identical** images in every
-combination, and that save/restore of the field round-trips exactly.
+Every back-end evaluates the same `Stencil.h` functions with the same operand
+order. Fused multiply-add is disabled where a compiler would otherwise use it
+(`--fmad=false` for nvcc, `-ffp-contract=off` for GCC/Clang; MSVC doesn't contract
+by default), because an FMA rounds differently from a separate multiply and add.
+As a result, the single-threaded, multi-threaded and both CUDA back-ends produce
+bit-identical fields for every equation, boundary condition and scene.
+
+Updated values smaller than 1e-12 are stored as zero. They are far below anything
+visible, and dropping them keeps the arithmetic out of the subnormal-float range,
+which otherwise slows the CPU back-ends down several times (Gray–Scott's fading
+*v* field, decaying waves).
 
 ## License
 
@@ -171,4 +189,3 @@ SOFTWARE.
 If you found this project interesting or useful, you can support my work:
 
 [![GitHub Sponsors](https://img.shields.io/github/sponsors/makarov-mm?style=flat&logo=github)](https://github.com/sponsors/makarov-mm)
-

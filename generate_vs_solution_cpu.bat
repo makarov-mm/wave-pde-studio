@@ -1,22 +1,22 @@
 @echo off
 REM ---------------------------------------------------------------------------
-REM Generates a CPU-only Visual Studio solution (no CUDA required).
-REM The CUDA back-end is left out; the two CPU back-ends remain in the UI.
+REM Generates a CPU-only Visual Studio solution (no CUDA toolkit needed):
+REM build-cpu\WavePDEStudio.sln. The two CPU back-ends remain in the UI.
+REM
+REM The Qt path lives in CMakePresets.json (preset "windows-cpu").
 REM ---------------------------------------------------------------------------
 
-REM Change this to your Qt path:
-set QT_DIR=C:\Qt\6.7.2\msvc2022_64
+cd /d "%~dp0"
+cmake --preset windows-cpu
 
-cmake -B build-cpu -S . -A x64 -DCMAKE_PREFIX_PATH="%QT_DIR%" -DUSE_CUDA=OFF
-
-if %ERRORLEVEL% NEQ 0 (
+if errorlevel 1 (
     echo.
-    echo CMake configuration FAILED. Check that QT_DIR points to a real Qt install.
+    echo CMake configuration FAILED. Check that CMAKE_PREFIX_PATH in
+    echo CMakePresets.json points to a real Qt install.
     pause
     exit /b 1
 )
 
 echo.
-echo Done. Open build-cpu\WavePDEStudio.sln in Visual Studio,
-echo choose Release ^| x64, and build.
+echo Done. Open build-cpu\WavePDEStudio.sln, choose Release ^| x64, and build.
 pause

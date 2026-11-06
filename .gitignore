@@ -29,3 +29,6 @@ ui_*.h
 .vs/
 .vscode/
 *.user
+
+# Local CMake presets (e.g. a different Qt path)
+CMakeUserPresets.json

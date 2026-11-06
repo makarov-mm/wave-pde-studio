@@ -1,26 +1,33 @@
-#include <QApplication>
-#include <QStyleFactory>
-#include <QPalette>
-#include <QColor>
 #include "MainWindow.h"
 
-int main(int argc, char** argv) {
+#include <QApplication>
+#include <QColor>
+#include <QPalette>
+
+namespace {
+
+QPalette darkPalette() {
+    QPalette palette;
+    palette.setColor(QPalette::Window,          QColor(30, 31, 34));
+    palette.setColor(QPalette::WindowText,      QColor(220, 220, 220));
+    palette.setColor(QPalette::Base,            QColor(24, 25, 28));
+    palette.setColor(QPalette::AlternateBase,   QColor(37, 38, 42));
+    palette.setColor(QPalette::Text,            QColor(220, 220, 220));
+    palette.setColor(QPalette::Button,          QColor(45, 46, 50));
+    palette.setColor(QPalette::ButtonText,      QColor(230, 230, 230));
+    palette.setColor(QPalette::Highlight,       QColor(64, 132, 214));
+    palette.setColor(QPalette::HighlightedText, Qt::white);
+    return palette;
+}
+
+} // namespace
+
+int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
+    QApplication::setStyle("Fusion");
+    QApplication::setPalette(darkPalette());
 
-    app.setStyle(QStyleFactory::create("Fusion"));
-    QPalette dark;
-    dark.setColor(QPalette::Window,          QColor(30, 31, 34));
-    dark.setColor(QPalette::WindowText,      QColor(220, 220, 220));
-    dark.setColor(QPalette::Base,            QColor(24, 25, 28));
-    dark.setColor(QPalette::AlternateBase,   QColor(37, 38, 42));
-    dark.setColor(QPalette::Text,            QColor(220, 220, 220));
-    dark.setColor(QPalette::Button,          QColor(45, 46, 50));
-    dark.setColor(QPalette::ButtonText,      QColor(230, 230, 230));
-    dark.setColor(QPalette::Highlight,       QColor(64, 132, 214));
-    dark.setColor(QPalette::HighlightedText, Qt::white);
-    app.setPalette(dark);
-
-    MainWindow w;
-    w.show();
-    return app.exec();
+    MainWindow window;
+    window.show();
+    return QApplication::exec();
 }

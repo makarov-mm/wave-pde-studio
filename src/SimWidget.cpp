@@ -1,58 +1,69 @@
 #include "SimWidget.h"
-#include <QPainter>
+
 #include <QMouseEvent>
+#include <QPainter>
+
 #include <algorithm>
+#include <utility>
 
 SimWidget::SimWidget(QWidget* parent) : QWidget(parent) {
     setMinimumSize(320, 320);
     setCursor(Qt::CrossCursor);
     setAttribute(Qt::WA_OpaquePaintEvent, true);
-    setContextMenuPolicy(Qt::NoContextMenu);   // right button is the wall brush
+    setContextMenuPolicy(Qt::NoContextMenu);   // the right button is the wall brush
 }
 
-void SimWidget::setImage(const QImage& img) {
-    m_image = img;
+void SimWidget::setImage(QImage image) {
+    m_image = std::move(image);
     update();
 }
 
+QRect SimWidget::imageRect() const {
+    if (m_image.isNull())
+        return rect();
+    QRect target(QPoint(0, 0), m_image.size().scaled(size(), Qt::KeepAspectRatio));
+    target.moveCenter(rect().center());
+    return target;
+}
+
 void SimWidget::paintEvent(QPaintEvent*) {
-    QPainter p(this);
-    p.fillRect(rect(), Qt::black);
-    if (!m_image.isNull()) {
-        // Scale the (grid-resolution) field image to fill the widget.
-        p.drawImage(rect(), m_image, m_image.rect());
+    QPainter painter(this);
+    painter.fillRect(rect(), Qt::black);
+    if (!m_image.isNull())
+        painter.drawImage(imageRect(), m_image);   // grid resolution scaled up, square cells stay square
+}
+
+QPointF SimWidget::normalized(const QPointF& position) const {
+    const QRect target = imageRect();
+    if (target.isEmpty())
+        return {0.0, 0.0};
+    return { std::clamp((position.x() - target.x()) / target.width(), 0.0, 1.0),
+             std::clamp((position.y() - target.y()) / target.height(), 0.0, 1.0) };
+}
+
+void SimWidget::mousePressEvent(QMouseEvent* event) {
+    const QPointF n = normalized(event->position());
+    if (event->button() == Qt::LeftButton) {
+        m_injecting = true;
+        emit injectAt(static_cast<float>(n.x()), static_cast<float>(n.y()));
+    } else if (event->button() == Qt::RightButton) {
+        m_paintingWall = true;
+        m_erasingWall  = event->modifiers().testFlag(Qt::ShiftModifier);
+        emit wallAt(static_cast<float>(n.x()), static_cast<float>(n.y()), m_erasingWall);
     }
 }
 
-QPointF SimWidget::normalized(const QPointF& pos) const {
-    float nx = (width()  > 0) ? (float)(pos.x() / width())  : 0.0f;
-    float ny = (height() > 0) ? (float)(pos.y() / height()) : 0.0f;
-    nx = std::min(1.0f, std::max(0.0f, nx));
-    ny = std::min(1.0f, std::max(0.0f, ny));
-    return QPointF(nx, ny);
+void SimWidget::mouseMoveEvent(QMouseEvent* event) {
+    const QPointF n = normalized(event->position());
+    if (m_injecting)
+        emit injectAt(static_cast<float>(n.x()), static_cast<float>(n.y()));
+    if (m_paintingWall)
+        emit wallAt(static_cast<float>(n.x()), static_cast<float>(n.y()), m_erasingWall);
 }
 
-void SimWidget::mousePressEvent(QMouseEvent* e) {
-    QPointF n = normalized(e->position());
-    if (e->button() == Qt::LeftButton) {
-        m_drawing = true;
-        emit injectAt((float)n.x(), (float)n.y());
-    } else if (e->button() == Qt::RightButton) {
-        m_wallDrawing = true;
-        m_wallErase   = e->modifiers().testFlag(Qt::ShiftModifier);
-        emit wallAt((float)n.x(), (float)n.y(), m_wallErase);
-    }
-}
-
-void SimWidget::mouseMoveEvent(QMouseEvent* e) {
-    QPointF n = normalized(e->position());
-    if (m_drawing)
-        emit injectAt((float)n.x(), (float)n.y());
-    if (m_wallDrawing)
-        emit wallAt((float)n.x(), (float)n.y(), m_wallErase);
-}
-
-void SimWidget::mouseReleaseEvent(QMouseEvent* e) {
-    if (e->button() == Qt::LeftButton)  m_drawing     = false;
-    if (e->button() == Qt::RightButton) m_wallDrawing = false;
+void SimWidget::mouseReleaseEvent(QMouseEvent* event) {
+    if (event->button() == Qt::LeftButton)
+        m_injecting = false;
+    else if (event->button() == Qt::RightButton)
+        m_paintingWall = false;
 }

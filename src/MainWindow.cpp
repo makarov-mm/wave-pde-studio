@@ -1,41 +1,84 @@
 #include "MainWindow.h"
 #include "SimWidget.h"
 
-#include <QWidget>
 #include <QComboBox>
+#include <QDateTime>
+#include <QDir>
+#include <QFileDialog>
+#include <QFormLayout>
+#include <QFrame>
+#include <QGroupBox>
+#include <QGuiApplication>
+#include <QHBoxLayout>
+#include <QKeySequence>
+#include <QLabel>
+#include <QMessageBox>
+#include <QPushButton>
+#include <QScopeGuard>
+#include <QShortcut>
+#include <QSignalBlocker>
 #include <QSlider>
 #include <QSpinBox>
-#include <QLabel>
-#include <QPushButton>
-#include <QGroupBox>
-#include <QFormLayout>
-#include <QVBoxLayout>
-#include <QHBoxLayout>
-#include <QFrame>
 #include <QTimer>
-#include <QList>
-#include <QFileDialog>
-#include <QDateTime>
-#include <QShortcut>
-#include <QKeySequence>
+#include <QVBoxLayout>
+
 #include <algorithm>
+#include <array>
+#include <cstddef>
+#include <utility>
+#include <vector>
 
 namespace {
 
-// Gray-Scott feed/kill presets, in slider units (value / 10000).
-struct GsPreset { const char* name; int feed; int kill; };
-const GsPreset kGsPresets[] = {
-    { "Custom",  0,   0   },
-    { "Coral",   545, 620 },
-    { "Mitosis", 367, 649 },
-    { "Worms",   780, 610 },
-    { "Spots",   300, 620 },
-    { "Chaos",   260, 510 },
+constexpr int kFrameIntervalMs = 16;    // ~60 fps
+constexpr int kBenchmarkSteps  = 100;
+
+// Sliders hold integers: parameter = slider value / scale.
+constexpr float kWaveSpeedScale = 100.0f;
+constexpr float kDiffusionScale = 100.0f;
+constexpr float kDampingScale   = 10000.0f;
+constexpr float kFeedKillScale  = 10000.0f;
+constexpr float kBrushSizeScale = 1000.0f;   // fraction of the grid width
+constexpr float kBrushAmpScale  = 100.0f;
+
+// Gray-Scott feed/kill presets, in slider units.
+struct GrayScottPreset {
+    const char* name;
+    int         feed;
+    int         kill;
 };
+constexpr std::array kGrayScottPresets{
+    GrayScottPreset{"Coral",   545, 620},
+    GrayScottPreset{"Mitosis", 367, 649},
+    GrayScottPreset{"Worms",   780, 610},
+    GrayScottPreset{"Spots",   300, 620},
+    GrayScottPreset{"Chaos",   260, 510},
+};
+constexpr int kCustomPattern = 0;   // the pattern combo lists "Custom" first, then the presets
+
+constexpr bool isCuda(Backend backend) {
+    return backend == Backend::Cuda || backend == Backend::CudaTiled;
+}
+
+QSlider* makeSlider(int minimum, int maximum, int value) {
+    auto* slider = new QSlider(Qt::Horizontal);
+    slider->setRange(minimum, maximum);
+    slider->setValue(value);
+    return slider;
+}
+
+template <class Enum>
+void addItem(QComboBox* combo, const QString& text, Enum value) {
+    combo->addItem(text, std::to_underlying(value));
+}
+
+template <class Enum>
+Enum currentValue(const QComboBox* combo) {
+    return static_cast<Enum>(combo->currentData().toInt());
+}
 
 // A slider with a small live value label to its right.
-QWidget* withValueLabel(QSlider* slider, QLabel*& label) {
-    label = new QLabel;
+QWidget* withValueLabel(QSlider* slider, QLabel* label) {
     label->setMinimumWidth(44);
     label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     auto* row    = new QWidget;
@@ -48,92 +91,93 @@ QWidget* withValueLabel(QSlider* slider, QLabel*& label) {
 
 } // namespace
 
-MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
-    bool cuda = Simulator::cudaSupported();
-    setWindowTitle(cuda ? "Wave / Heat PDE Studio — CPU vs CUDA"
-                        : "Wave / Heat PDE Studio — CPU only");
+MainWindow::MainWindow(QWidget* parent)
+    : QMainWindow(parent), m_cudaIssue(Simulator::cudaUnavailableReason()) {
+    setWindowTitle(m_cudaIssue.isEmpty() ? "Wave / Heat PDE Studio — CPU vs CUDA"
+                                         : "Wave / Heat PDE Studio — CPU only");
 
-    m_suppress = true;
+    m_canvas = new SimWidget;
 
-    // ---- Canvas ------------------------------------------------------------
-    m_canvas = new SimWidget(this);
+    auto* central       = new QWidget;
+    auto* centralLayout = new QHBoxLayout(central);
+    centralLayout->setContentsMargins(0, 0, 0, 0);
+    centralLayout->addWidget(createControlPanel());
+    centralLayout->addWidget(m_canvas, 1);
+    setCentralWidget(central);
+    resize(1240, 860);
 
-    // ---- Controls ----------------------------------------------------------
+    connectSignals();
+
+    onControlsChanged();
+    updateControlStates();
+    resetSimulation();
+
+    auto* timer = new QTimer(this);
+    connect(timer, &QTimer::timeout, this, &MainWindow::onTick);
+    timer->start(kFrameIntervalMs);
+}
+
+QWidget* MainWindow::createControlPanel() {
     m_eqCombo = new QComboBox;
-    m_eqCombo->addItem("Wave equation");
-    m_eqCombo->addItem("Heat equation");
-    m_eqCombo->addItem("Gray\u2013Scott reaction\u2013diffusion");
+    addItem(m_eqCombo, "Wave equation", Equation::Wave);
+    addItem(m_eqCombo, "Heat equation", Equation::Heat);
+    addItem(m_eqCombo, "Gray–Scott reaction–diffusion", Equation::GrayScott);
 
     m_sceneCombo = new QComboBox;
-    m_sceneCombo->addItem("Empty");
-    m_sceneCombo->addItem("Double slit");
-    m_sceneCombo->addItem("Ring cavity");
-    m_sceneCombo->addItem("Pillar lattice");
+    addItem(m_sceneCombo, "Empty", Scene::Empty);
+    addItem(m_sceneCombo, "Double slit", Scene::DoubleSlit);
+    addItem(m_sceneCombo, "Ring cavity", Scene::RingCavity);
+    addItem(m_sceneCombo, "Pillar lattice", Scene::PillarLattice);
 
     m_gridCombo = new QComboBox;
-    m_gridCombo->addItem("256 x 256", 256);
-    m_gridCombo->addItem("512 x 512", 512);
-    m_gridCombo->addItem("1024 x 1024", 1024);
-    m_gridCombo->setCurrentIndex(1);
+    for (const int size : {256, 512, 1024})
+        m_gridCombo->addItem(QString("%1 x %1").arg(size), size);
+    m_gridCombo->setCurrentIndex(m_gridCombo->findData(m_params.gridW));
 
     m_boundaryCombo = new QComboBox;
-    m_boundaryCombo->addItem("Fixed (Dirichlet)");
-    m_boundaryCombo->addItem("Reflective (Neumann)");
-    m_boundaryCombo->addItem("Periodic (wrap)");
+    addItem(m_boundaryCombo, "Fixed (Dirichlet)", Boundary::Dirichlet);
+    addItem(m_boundaryCombo, "Reflective (Neumann)", Boundary::Neumann);
+    addItem(m_boundaryCombo, "Periodic (wrap)", Boundary::Periodic);
 
-    m_speedSlider = new QSlider(Qt::Horizontal);
-    m_speedSlider->setRange(5, 70);        // waveSpeed = value / 100
-    m_speedSlider->setValue(50);
+    m_speedSlider = makeSlider(5, 70, 50);   // waveSpeed 0.05..0.70 (stable below 1/sqrt(2))
+    m_dampSlider  = makeSlider(0, 50, 5);    // damping 0..0.005
+    m_diffSlider  = makeSlider(1, 24, 20);   // diffusion 0.01..0.24 (stable below 0.25)
 
-    m_diffSlider = new QSlider(Qt::Horizontal);
-    m_diffSlider->setRange(1, 24);         // diffusion = value / 100
-    m_diffSlider->setValue(20);
+    m_patternCombo = new QComboBox;
+    m_patternCombo->addItem("Custom");
+    for (const GrayScottPreset& preset : kGrayScottPresets)
+        m_patternCombo->addItem(preset.name);
+    m_patternCombo->setCurrentIndex(1);      // Coral
 
-    m_dampSlider = new QSlider(Qt::Horizontal);
-    m_dampSlider->setRange(0, 50);         // damping = value / 10000
-    m_dampSlider->setValue(5);
+    m_feedSlider = makeSlider(100, 900, kGrayScottPresets[0].feed);   // feed 0.01..0.09
+    m_killSlider = makeSlider(400, 750, kGrayScottPresets[0].kill);   // kill 0.04..0.075
+    m_feedLabel  = new QLabel;
+    m_killLabel  = new QLabel;
 
-    m_gsPresetCombo = new QComboBox;
-    for (const auto& pr : kGsPresets)
-        m_gsPresetCombo->addItem(pr.name);
-    m_gsPresetCombo->setCurrentIndex(1);   // Coral
+    m_brushSlider = makeSlider(5, 100, 25);  // brush radius 0.5%..10% of the grid width
+    m_ampSlider   = makeSlider(10, 200, 100);
 
-    m_feedSlider = new QSlider(Qt::Horizontal);
-    m_feedSlider->setRange(100, 900);      // feed = value / 10000
-    m_feedSlider->setValue(kGsPresets[1].feed);
-
-    m_killSlider = new QSlider(Qt::Horizontal);
-    m_killSlider->setRange(400, 750);      // kill = value / 10000
-    m_killSlider->setValue(kGsPresets[1].kill);
-
-    m_brushSlider = new QSlider(Qt::Horizontal);
-    m_brushSlider->setRange(5, 100);       // brushRadius = value / 1000 (of width)
-    m_brushSlider->setValue(25);
-
-    m_ampSlider = new QSlider(Qt::Horizontal);
-    m_ampSlider->setRange(10, 200);        // brushAmp = value / 100
-    m_ampSlider->setValue(100);
-
-    m_colorCombo = new QComboBox;
-    m_colorCombo->addItem("Thermal / diverging");
-    m_colorCombo->addItem("Ocean");
-    m_colorCombo->addItem("Grayscale");
-    m_colorCombo->addItem("Viridis");
-    m_colorCombo->addItem("Magma");
+    m_paletteCombo = new QComboBox;
+    addItem(m_paletteCombo, "Thermal / diverging", Palette::Thermal);
+    addItem(m_paletteCombo, "Ocean", Palette::Ocean);
+    addItem(m_paletteCombo, "Grayscale", Palette::Grayscale);
+    addItem(m_paletteCombo, "Viridis", Palette::Viridis);
+    addItem(m_paletteCombo, "Magma", Palette::Magma);
 
     m_substepsSpin = new QSpinBox;
     m_substepsSpin->setRange(1, 50);
     m_substepsSpin->setValue(m_params.substeps);
 
     m_backendCombo = new QComboBox;
-    m_backendCombo->addItem("CPU (single-threaded)", (int)Backend::CpuSingle);
-    m_backendCombo->addItem("CPU (multi-threaded)",  (int)Backend::CpuMulti);
-    if (cuda) {
-        m_backendCombo->addItem("CUDA (GPU)",        (int)Backend::Cuda);
-        m_backendCombo->addItem("CUDA (GPU, tiled)", (int)Backend::CudaTiled);
+    addItem(m_backendCombo, Simulator::backendName(Backend::CpuSingle), Backend::CpuSingle);
+    addItem(m_backendCombo, Simulator::backendName(Backend::CpuMulti), Backend::CpuMulti);
+    if (m_cudaIssue.isEmpty()) {
+        addItem(m_backendCombo, Simulator::backendName(Backend::Cuda), Backend::Cuda);
+        addItem(m_backendCombo, Simulator::backendName(Backend::CudaTiled), Backend::CudaTiled);
+        m_backendCombo->setCurrentIndex(m_backendCombo->findData(std::to_underlying(Backend::Cuda)));
+    } else {
+        m_backendCombo->setToolTip("CUDA unavailable: " + m_cudaIssue);
     }
-    int cudaIdx = m_backendCombo->findData((int)Backend::Cuda);
-    if (cudaIdx >= 0) m_backendCombo->setCurrentIndex(cudaIdx);
 
     auto* form = new QFormLayout;
     form->addRow("Equation",    m_eqCombo);
@@ -143,221 +187,244 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     form->addRow("Wave speed",  m_speedSlider);
     form->addRow("Damping",     m_dampSlider);
     form->addRow("Diffusion",   m_diffSlider);
-    form->addRow("Pattern",     m_gsPresetCombo);
+    form->addRow("Pattern",     m_patternCombo);
     form->addRow("Feed F",      withValueLabel(m_feedSlider, m_feedLabel));
     form->addRow("Kill k",      withValueLabel(m_killSlider, m_killLabel));
     form->addRow("Brush size",  m_brushSlider);
     form->addRow("Brush power", m_ampSlider);
-    form->addRow("Palette",     m_colorCombo);
+    form->addRow("Palette",     m_paletteCombo);
     form->addRow("Steps/frame", m_substepsSpin);
     form->addRow("Backend",     m_backendCombo);
     auto* paramsBox = new QGroupBox("Parameters");
     paramsBox->setLayout(form);
 
-    m_playButton       = new QPushButton("Pause");
-    auto* resetButton  = new QPushButton("Reset");
-    auto* benchButton  = new QPushButton("Benchmark all backends");
-    auto* exportButton = new QPushButton("Export PNG\u2026");
+    m_playButton   = new QPushButton("Pause");
+    m_resetButton  = new QPushButton("Reset");
+    m_benchButton  = new QPushButton("Benchmark all backends");
+    m_exportButton = new QPushButton("Export PNG…");
 
-    m_timingLabel = new QLabel("\u2014");
+    m_timingLabel = new QLabel("—");
     m_timingLabel->setWordWrap(true);
-    m_benchLabel  = new QLabel();
+    m_benchLabel = new QLabel;
     m_benchLabel->setWordWrap(true);
     m_benchLabel->setTextFormat(Qt::RichText);
+    if (!m_cudaIssue.isEmpty())
+        m_benchLabel->setText("<span style='color:#888'>CUDA unavailable: " + m_cudaIssue.toHtmlEscaped() + "</span>");
 
-    auto* statusBox    = new QGroupBox("Timing");
-    auto* statusLayout = new QVBoxLayout;
-    statusLayout->addWidget(m_timingLabel);
-    auto* line = new QFrame; line->setFrameShape(QFrame::HLine);
-    statusLayout->addWidget(line);
-    statusLayout->addWidget(m_benchLabel);
-    statusBox->setLayout(statusLayout);
+    auto* separator = new QFrame;
+    separator->setFrameShape(QFrame::HLine);
+    auto* timingLayout = new QVBoxLayout;
+    timingLayout->addWidget(m_timingLabel);
+    timingLayout->addWidget(separator);
+    timingLayout->addWidget(m_benchLabel);
+    auto* timingBox = new QGroupBox("Timing");
+    timingBox->setLayout(timingLayout);
 
-    auto* hint = new QLabel("Left-drag: pulse \u00b7 Right-drag: wall \u00b7 "
-                            "Shift+Right-drag: erase \u00b7 Space: pause \u00b7 R: reset");
+    auto* hint = new QLabel("Left-drag: pulse · Right-drag: wall · "
+                            "Shift+Right-drag: erase · Space: pause · R: reset");
     hint->setStyleSheet("color: #888;");
     hint->setWordWrap(true);
 
     auto* panelLayout = new QVBoxLayout;
     panelLayout->addWidget(paramsBox);
     panelLayout->addWidget(m_playButton);
-    panelLayout->addWidget(resetButton);
-    panelLayout->addWidget(benchButton);
-    panelLayout->addWidget(exportButton);
-    panelLayout->addWidget(statusBox);
+    panelLayout->addWidget(m_resetButton);
+    panelLayout->addWidget(m_benchButton);
+    panelLayout->addWidget(m_exportButton);
+    panelLayout->addWidget(timingBox);
     panelLayout->addStretch();
     panelLayout->addWidget(hint);
 
     auto* panel = new QWidget;
     panel->setLayout(panelLayout);
     panel->setFixedWidth(320);
+    return panel;
+}
 
-    auto* central       = new QWidget;
-    auto* centralLayout = new QHBoxLayout(central);
-    centralLayout->setContentsMargins(0, 0, 0, 0);
-    centralLayout->addWidget(panel);
-    centralLayout->addWidget(m_canvas, 1);
-    setCentralWidget(central);
-    resize(1240, 860);
-
-    // ---- Wiring ------------------------------------------------------------
+void MainWindow::connectSignals() {
     connect(m_eqCombo,       &QComboBox::currentIndexChanged, this, &MainWindow::onEquationChanged);
     connect(m_sceneCombo,    &QComboBox::currentIndexChanged, this, &MainWindow::onSceneChanged);
     connect(m_gridCombo,     &QComboBox::currentIndexChanged, this, &MainWindow::onGridChanged);
     connect(m_boundaryCombo, &QComboBox::currentIndexChanged, this, &MainWindow::onControlsChanged);
-    connect(m_colorCombo,    &QComboBox::currentIndexChanged, this, &MainWindow::onControlsChanged);
-    connect(m_backendCombo,  &QComboBox::currentIndexChanged, this, &MainWindow::onBackendChanged);
-    connect(m_gsPresetCombo, &QComboBox::currentIndexChanged, this, &MainWindow::onGsPresetChanged);
+    connect(m_paletteCombo,  &QComboBox::currentIndexChanged, this, &MainWindow::onControlsChanged);
+    connect(m_backendCombo,  &QComboBox::currentIndexChanged, this, &MainWindow::resetTiming);
+    connect(m_patternCombo,  &QComboBox::currentIndexChanged, this, &MainWindow::onGrayScottPresetChanged);
     connect(m_substepsSpin,  &QSpinBox::valueChanged,         this, &MainWindow::onControlsChanged);
-    connect(m_speedSlider,   &QSlider::valueChanged,          this, &MainWindow::onControlsChanged);
-    connect(m_diffSlider,    &QSlider::valueChanged,          this, &MainWindow::onControlsChanged);
-    connect(m_dampSlider,    &QSlider::valueChanged,          this, &MainWindow::onControlsChanged);
-    connect(m_feedSlider,    &QSlider::valueChanged,          this, &MainWindow::onGsParamEdited);
-    connect(m_killSlider,    &QSlider::valueChanged,          this, &MainWindow::onGsParamEdited);
-    connect(m_brushSlider,   &QSlider::valueChanged,          this, &MainWindow::onControlsChanged);
-    connect(m_ampSlider,     &QSlider::valueChanged,          this, &MainWindow::onControlsChanged);
-    connect(m_playButton,    &QPushButton::clicked,           this, &MainWindow::onPlayPause);
-    connect(resetButton,     &QPushButton::clicked,           this, &MainWindow::onReset);
-    connect(benchButton,     &QPushButton::clicked,           this, &MainWindow::onBenchmark);
-    connect(exportButton,    &QPushButton::clicked,           this, &MainWindow::onExportPng);
-    connect(m_canvas,        &SimWidget::injectAt,            this, &MainWindow::onInject);
-    connect(m_canvas,        &SimWidget::wallAt,              this, &MainWindow::onWall);
+    connect(m_feedSlider,    &QSlider::valueChanged,          this, &MainWindow::onGrayScottParamEdited);
+    connect(m_killSlider,    &QSlider::valueChanged,          this, &MainWindow::onGrayScottParamEdited);
+    for (QSlider* slider : {m_speedSlider, m_diffSlider, m_dampSlider, m_brushSlider, m_ampSlider})
+        connect(slider, &QSlider::valueChanged, this, &MainWindow::onControlsChanged);
 
-    new QShortcut(QKeySequence(Qt::Key_Space), this, SLOT(onPlayPause()));
-    new QShortcut(QKeySequence(Qt::Key_R),     this, SLOT(onReset()));
+    connect(m_playButton,   &QPushButton::clicked, this, &MainWindow::onPlayPause);
+    connect(m_resetButton,  &QPushButton::clicked, this, &MainWindow::onReset);
+    connect(m_benchButton,  &QPushButton::clicked, this, &MainWindow::onBenchmark);
+    connect(m_exportButton, &QPushButton::clicked, this, &MainWindow::onExportPng);
 
-    m_suppress = false;
+    connect(m_canvas, &SimWidget::injectAt, this, &MainWindow::onInject);
+    connect(m_canvas, &SimWidget::wallAt,   this, &MainWindow::onWall);
 
-    // Initialize state and start the animation loop (~60 fps).
-    onControlsChanged();          // pull slider values into m_params
-    updateEnabled();
-    updateGsLabels();
-    m_sim.reset(m_params);
-    renderNow();
-    m_timer = new QTimer(this);
-    connect(m_timer, &QTimer::timeout, this, &MainWindow::onTick);
-    m_timer->start(16);
+    connect(new QShortcut(QKeySequence(Qt::Key_Space), this), &QShortcut::activated, this, &MainWindow::onPlayPause);
+    connect(new QShortcut(QKeySequence(Qt::Key_R), this),     &QShortcut::activated, this, &MainWindow::onReset);
 }
 
 Backend MainWindow::currentBackend() const {
-    return static_cast<Backend>(m_backendCombo->currentData().toInt());
+    return currentValue<Backend>(m_backendCombo);
+}
+
+float MainWindow::brushRadiusCells() const {
+    return std::max(2.0f, static_cast<float>(m_params.gridW) * m_params.brushRadius);
+}
+
+void MainWindow::resetSimulation() {
+    m_sim.reset(m_params);
+    renderNow();
 }
 
 void MainWindow::renderNow() {
     m_canvas->setImage(m_sim.toImage(m_params));
 }
 
-void MainWindow::updateEnabled() {
-    bool wave = (m_params.equation == Equation::Wave);
-    bool heat = (m_params.equation == Equation::Heat);
-    bool gs   = (m_params.equation == Equation::GrayScott);
+void MainWindow::resetTiming() {
+    m_stepMsAverage.reset();
+}
+
+void MainWindow::updateControlStates() {
+    const bool wave      = m_params.equation == Equation::Wave;
+    const bool heat      = m_params.equation == Equation::Heat;
+    const bool grayScott = m_params.equation == Equation::GrayScott;
     m_speedSlider->setEnabled(wave);
     m_dampSlider->setEnabled(wave);
     m_diffSlider->setEnabled(heat);
-    m_gsPresetCombo->setEnabled(gs);
-    m_feedSlider->setEnabled(gs);
-    m_killSlider->setEnabled(gs);
-    m_feedLabel->setEnabled(gs);
-    m_killLabel->setEnabled(gs);
+    for (QWidget* widget : std::initializer_list<QWidget*>{m_patternCombo, m_feedSlider, m_killSlider, m_feedLabel, m_killLabel})
+        widget->setEnabled(grayScott);
 }
 
-void MainWindow::updateGsLabels() {
+void MainWindow::updateGrayScottLabels() {
     m_feedLabel->setText(QString::number(m_feedSlider->value() / 10000.0, 'f', 4));
     m_killLabel->setText(QString::number(m_killSlider->value() / 10000.0, 'f', 4));
 }
 
 void MainWindow::onTick() {
-    if (!m_playing) return;
-    StepResult r = m_sim.step(m_params, currentBackend());
+    if (!m_playing)
+        return;
+
+    const Backend backend = currentBackend();
+    StepResult result;
+    try {
+        result = m_sim.step(m_params, backend);
+    } catch (const std::exception& error) {
+        if (!isCuda(backend))
+            throw;   // the CPU back-ends can only fail by running out of memory
+        fallBackToCpu(error);
+        return;
+    }
     renderNow();
 
-    m_emaMs = (m_emaMs < 0.0) ? r.milliseconds
-                              : 0.9 * m_emaMs + 0.1 * r.milliseconds;
-    int    sub     = std::max(1, m_params.substeps);
-    double perStep = m_emaMs / sub;
-    double mcells  = (perStep > 0.0)
-        ? (double)m_params.gridW * m_params.gridH / perStep / 1000.0   // Mcells/s
-        : 0.0;
-    m_timingLabel->setText(QString("%1\n%2 ms / %3 steps\navg %4 ms/step \u00b7 %5 Mcells/s")
-                               .arg(r.backendName)
-                               .arg(QString::number(r.milliseconds, 'f', 2))
-                               .arg(sub)
-                               .arg(QString::number(perStep, 'f', 3))
-                               .arg(QString::number(mcells, 'f', 0)));
+    m_stepMsAverage = m_stepMsAverage ? 0.9 * *m_stepMsAverage + 0.1 * result.milliseconds : result.milliseconds;
+    const int    steps     = std::max(1, m_params.substeps);
+    const double msPerStep = *m_stepMsAverage / steps;
+    const double megaCellsPerSecond =
+        msPerStep > 0.0 ? static_cast<double>(m_params.gridW) * m_params.gridH / msPerStep / 1000.0 : 0.0;
+
+    m_timingLabel->setText(QString("%1\n%2 ms / %3 steps\navg %4 ms/step · %5 Mcells/s")
+                               .arg(Simulator::backendName(result.backend))
+                               .arg(result.milliseconds, 0, 'f', 2)
+                               .arg(steps)
+                               .arg(msPerStep, 0, 'f', 3)
+                               .arg(megaCellsPerSecond, 0, 'f', 0));
+}
+
+void MainWindow::fallBackToCpu(const std::exception& cudaError) {
+    // A failed launch or transfer can leave the CUDA context unusable, so the GPU
+    // back-ends are dropped for the rest of the session.
+    m_cudaIssue = QString::fromUtf8(cudaError.what());
+    {
+        const QSignalBlocker blocker(m_backendCombo);
+        for (const Backend backend : {Backend::Cuda, Backend::CudaTiled})
+            m_backendCombo->removeItem(m_backendCombo->findData(std::to_underlying(backend)));
+        m_backendCombo->setCurrentIndex(m_backendCombo->findData(std::to_underlying(Backend::CpuMulti)));
+    }
+    m_backendCombo->setToolTip("CUDA unavailable: " + m_cudaIssue);
+    resetTiming();
+    setWindowTitle("Wave / Heat PDE Studio — CPU only");
+
+    QMessageBox::warning(this, "CUDA back-end failed",
+                         m_cudaIssue + "\n\nThe simulation continues on the multi-threaded CPU back-end.");
 }
 
 void MainWindow::onControlsChanged() {
-    if (m_suppress) return;
-    m_params.waveSpeed   = m_speedSlider->value() / 100.0f;
-    m_params.diffusion   = m_diffSlider->value()  / 100.0f;
-    m_params.damping     = m_dampSlider->value()  / 10000.0f;
-    m_params.feed        = m_feedSlider->value()  / 10000.0f;
-    m_params.kill        = m_killSlider->value()  / 10000.0f;
-    m_params.brushRadius = m_brushSlider->value() / 1000.0f;
-    m_params.brushAmp    = m_ampSlider->value()   / 100.0f;
-    m_params.boundary    = m_boundaryCombo->currentIndex();
-    m_params.colorScheme = m_colorCombo->currentIndex();
+    const int previousSubsteps = m_params.substeps;
+
+    m_params.waveSpeed   = static_cast<float>(m_speedSlider->value()) / kWaveSpeedScale;
+    m_params.diffusion   = static_cast<float>(m_diffSlider->value()) / kDiffusionScale;
+    m_params.damping     = static_cast<float>(m_dampSlider->value()) / kDampingScale;
+    m_params.feed        = static_cast<float>(m_feedSlider->value()) / kFeedKillScale;
+    m_params.kill        = static_cast<float>(m_killSlider->value()) / kFeedKillScale;
+    m_params.brushRadius = static_cast<float>(m_brushSlider->value()) / kBrushSizeScale;
+    m_params.brushAmp    = static_cast<float>(m_ampSlider->value()) / kBrushAmpScale;
+    m_params.boundary    = currentValue<Boundary>(m_boundaryCombo);
+    m_params.palette     = currentValue<Palette>(m_paletteCombo);
     m_params.substeps    = m_substepsSpin->value();
-    updateGsLabels();
-    if (!m_playing) renderNow();
-}
 
-void MainWindow::onGsParamEdited() {
-    if (m_suppress) return;
-    // Manual feed/kill tweaking leaves the named presets: show "Custom".
-    m_suppress = true;
-    m_gsPresetCombo->setCurrentIndex(0);
-    m_suppress = false;
-    onControlsChanged();
-}
-
-void MainWindow::onGsPresetChanged() {
-    if (m_suppress) return;
-    int idx = m_gsPresetCombo->currentIndex();
-    if (idx <= 0) return;                       // Custom: keep current sliders
-    m_suppress = true;
-    m_feedSlider->setValue(kGsPresets[idx].feed);
-    m_killSlider->setValue(kGsPresets[idx].kill);
-    m_suppress = false;
-    onControlsChanged();
-    // A fresh field shows the new regime much better than a mid-flight switch.
-    if (m_params.equation == Equation::GrayScott) {
-        m_sim.reset(m_params);
+    if (m_params.substeps != previousSubsteps)
+        resetTiming();
+    updateGrayScottLabels();
+    if (!m_playing)
         renderNow();
+}
+
+void MainWindow::onGrayScottParamEdited() {
+    // Hand-tuned feed/kill values no longer match a named pattern.
+    {
+        const QSignalBlocker blocker(m_patternCombo);
+        m_patternCombo->setCurrentIndex(kCustomPattern);
     }
+    onControlsChanged();
+}
+
+void MainWindow::onGrayScottPresetChanged() {
+    const int index = m_patternCombo->currentIndex();
+    if (index <= kCustomPattern)
+        return;   // Custom: keep the current sliders
+
+    const GrayScottPreset& preset = kGrayScottPresets[static_cast<std::size_t>(index - 1)];
+    {
+        const QSignalBlocker feedBlocker(m_feedSlider);
+        const QSignalBlocker killBlocker(m_killSlider);
+        m_feedSlider->setValue(preset.feed);
+        m_killSlider->setValue(preset.kill);
+    }
+    onControlsChanged();
+
+    // A fresh field shows the new regime much better than a mid-flight switch.
+    if (m_params.equation == Equation::GrayScott)
+        resetSimulation();
 }
 
 void MainWindow::onEquationChanged() {
-    if (m_suppress) return;
-    m_params.equation = static_cast<Equation>(m_eqCombo->currentIndex());
-    updateEnabled();
+    m_params.equation = currentValue<Equation>(m_eqCombo);
+    updateControlStates();
 
-    // Gray-Scott evolves slowly per step; give it a higher default step rate.
-    m_suppress = true;
-    m_substepsSpin->setValue(m_params.equation == Equation::GrayScott ? 10 : 4);
-    m_suppress = false;
+    // Gray-Scott evolves slowly per step, so it gets a higher default step rate.
+    {
+        const QSignalBlocker blocker(m_substepsSpin);
+        m_substepsSpin->setValue(m_params.equation == Equation::GrayScott ? 10 : 4);
+    }
     m_params.substeps = m_substepsSpin->value();
 
-    m_sim.reset(m_params);
-    renderNow();
+    resetTiming();
+    resetSimulation();
 }
 
 void MainWindow::onSceneChanged() {
-    if (m_suppress) return;
-    m_params.scene = m_sceneCombo->currentIndex();
-    m_sim.reset(m_params);
-    renderNow();
+    m_params.scene = currentValue<Scene>(m_sceneCombo);
+    resetSimulation();
 }
 
 void MainWindow::onGridChanged() {
-    if (m_suppress) return;
     m_params.gridW = m_params.gridH = m_gridCombo->currentData().toInt();
-    m_sim.reset(m_params);
-    renderNow();
-}
-
-void MainWindow::onBackendChanged() {
-    m_emaMs = -1.0;   // restart the moving average for the new backend
+    resetTiming();
+    resetSimulation();
 }
 
 void MainWindow::onPlayPause() {
@@ -366,59 +433,73 @@ void MainWindow::onPlayPause() {
 }
 
 void MainWindow::onReset() {
-    m_sim.reset(m_params);
-    renderNow();
+    resetSimulation();
 }
 
 void MainWindow::onExportPng() {
-    QString name = QString("pde-%1.png")
-                       .arg(QDateTime::currentDateTime().toString("yyyyMMdd-hhmmss"));
-    QString path = QFileDialog::getSaveFileName(this, "Export image", name,
-                                                "PNG image (*.png)");
-    if (path.isEmpty()) return;
-    m_sim.toImage(m_params).save(path, "PNG");
+    const QString suggestedName =
+        QString("pde-%1.png").arg(QDateTime::currentDateTime().toString("yyyyMMdd-hhmmss"));
+    const QString path = QFileDialog::getSaveFileName(this, "Export image", suggestedName, "PNG image (*.png)");
+    if (path.isEmpty())
+        return;
+    if (!m_sim.toImage(m_params).save(path, "PNG"))
+        QMessageBox::warning(this, "Export image", QString("Could not save %1.").arg(QDir::toNativeSeparators(path)));
 }
 
 void MainWindow::onInject(float nx, float ny) {
-    float radius = std::max(2.0f, m_params.gridW * m_params.brushRadius);
-    m_sim.inject(m_params, nx, ny, radius, m_params.brushAmp);
-    if (!m_playing) renderNow();
+    m_sim.inject(m_params, nx, ny, brushRadiusCells(), m_params.brushAmp);
+    if (!m_playing)
+        renderNow();
 }
 
 void MainWindow::onWall(float nx, float ny, bool erase) {
-    float radius = std::max(2.0f, m_params.gridW * m_params.brushRadius);
-    m_sim.setWall(m_params, nx, ny, radius, erase);
-    if (!m_playing) renderNow();
+    m_sim.paintWall(m_params, nx, ny, brushRadiusCells(), erase);
+    if (!m_playing)
+        renderNow();
 }
 
 void MainWindow::onBenchmark() {
-    QList<Backend> backends { Backend::CpuSingle, Backend::CpuMulti };
-    if (Simulator::cudaSupported())
-        backends << Backend::Cuda << Backend::CudaTiled;
+    std::vector<Backend> backends{Backend::CpuSingle, Backend::CpuMulti};
+    if (m_cudaIssue.isEmpty())
+        backends.insert(backends.end(), {Backend::Cuda, Backend::CudaTiled});
 
-    const int benchSteps = 100;
-    int savedSub = m_params.substeps;
-    m_params.substeps = benchSteps;   // advance a fixed batch per timed run
+    SimParams measured = m_params;
+    measured.substeps  = kBenchmarkSteps;
+    SimParams warmUp   = m_params;
+    warmUp.substeps    = 1;
 
-    QString text = QString("<b>Benchmark</b> (%1x%2, %3 steps)<br/>")
-                       .arg(m_params.gridW).arg(m_params.gridH).arg(benchSteps);
+    QGuiApplication::setOverrideCursor(Qt::WaitCursor);
+    const auto restoreCursor = qScopeGuard([] { QGuiApplication::restoreOverrideCursor(); });
 
-    double ref = -1.0;
-    m_sim.saveState();
-    for (Backend b : backends) {
-        m_sim.restoreState();                 // every backend starts from the same field
-        StepResult r = m_sim.step(m_params, b);
-        double perStep = r.milliseconds / benchSteps;
-        if (b == Backend::CpuSingle) ref = perStep;
-        double sp = (ref > 0.0) ? ref / perStep : 1.0;
-        text += QString("%1: <b>%2 ms/step</b> (%3x)<br/>")
-                    .arg(r.backendName)
-                    .arg(QString::number(perStep, 'f', 4))
-                    .arg(QString::number(sp, 'f', 1));
+    QString report = QString("<b>Benchmark</b> (%1x%2, %3 steps)<br/>")
+                         .arg(m_params.gridW)
+                         .arg(m_params.gridH)
+                         .arg(kBenchmarkSteps);
+
+    const Simulator::Snapshot start = m_sim.snapshot();
+    std::optional<double> baseline;   // ms/step of the first (single-threaded) back-end
+    for (const Backend backend : backends) {
+        try {
+            // The first use of a back-end pays one-time costs (thread start-up, CUDA
+            // context, device allocations): run one step first to keep them out.
+            m_sim.restore(start);
+            m_sim.step(warmUp, backend);
+
+            m_sim.restore(start);   // every back-end starts from the same field
+            const double msPerStep = m_sim.step(measured, backend).milliseconds / kBenchmarkSteps;
+            if (!baseline)
+                baseline = msPerStep;
+            report += QString("%1: <b>%2 ms/step</b> (%3x)<br/>")
+                          .arg(Simulator::backendName(backend))
+                          .arg(msPerStep, 0, 'f', 4)
+                          .arg(*baseline / msPerStep, 0, 'f', 1);
+        } catch (const std::exception& error) {
+            report += QString("%1: failed (%2)<br/>")
+                          .arg(Simulator::backendName(backend), QString::fromUtf8(error.what()).toHtmlEscaped());
+        }
     }
-    m_sim.restoreState();
-    m_params.substeps = savedSub;
+    m_sim.restore(start);
 
-    m_benchLabel->setText(text);
+    m_benchLabel->setText(report);
     renderNow();
 }
